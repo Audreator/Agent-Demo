@@ -240,8 +240,11 @@ async def test_tool_consecutive_failures_disable_tool(settings: Settings, db: An
     calls = (
         await db.execute(select(ToolCall).where(ToolCall.session_id == session.id))
     ).scalars().all()
-    assert len(calls) == 3
-    assert all(call.status == "error" for call in calls)
+    assert len(calls) == 4
+    assert sum(1 for call in calls if call.status == "error") == 3
+    blocked_calls = [call for call in calls if call.status == "blocked"]
+    assert len(blocked_calls) == 1
+    assert blocked_calls[0].tool_name == "weather"
     statuses = [data.get("status") for name, data in collector.events if name == "tool_result"]
     assert statuses.count("error") == 3
     assert statuses.count("blocked") == 1

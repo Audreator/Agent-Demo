@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 from typing import Any
 from uuid import UUID
 
+from app.citations import sanitize_citations
 from app.config import Settings
 from app.context.manager import tool_result_summary
 from app.errors import MCPError, ToolExecutionError
@@ -29,6 +30,7 @@ class ToolExecutionResult:
     attempts: int = 0
     arguments: dict[str, Any] = field(default_factory=dict)
     artifact_id: str | None = None
+    citations: list[dict[str, Any]] = field(default_factory=list)
 
 
 class ToolExecutor:
@@ -105,6 +107,11 @@ class ToolExecutor:
                         user_id=self.user_id,
                         session_id=str(session_id),
                         tool_call_id=tool_call_id,
+                        timeout=(
+                            max(self.settings.mcp_timeout, 60.0)
+                            if name == "search"
+                            else None
+                        ),
                     )
                     text, data, is_error = _parse_tool_response(response)
                     latency = int((time.monotonic() - started) * 1000)
@@ -128,6 +135,27 @@ class ToolExecutor:
                     tool_call_id, text, data, session_id
                 )
                 summary = _summarize(name, data, text)
+                citations = (
+                    sanitize_citations(
+                        data.get("citations"),
+                        prefix=tool_call_id,
+                        limit=self.settings.citation_max_total,
+                    )
+                    if name == "search" and isinstance(data, dict)
+                    else []
+                )
+                for citation in citations:
+                    if citation.get("rejected"):
+                        await self.tracer.emit_event(
+                            "link_check_rejected",
+                            {
+                                "url": citation.get("url"),
+                                "reason": citation.get("reason"),
+                                "tool_call_id": tool_call_id,
+                            },
+                            session_id=str(session_id),
+                            turn_no=turn_no,
+                        )
                 await self.tracer.emit_event(
                     "tool_result",
                     {
@@ -137,6 +165,8 @@ class ToolExecutor:
                         "result_size": len(text),
                         "latency_ms": latency,
                         "result_ref": result_ref,
+                        "citations": len(citations),
+                        "reachable": sum(1 for item in citations if item.get("reachable")),
                     },
                     session_id=str(session_id),
                     turn_no=turn_no,
@@ -152,6 +182,7 @@ class ToolExecutor:
                     attempts=attempt,
                     arguments=prepared,
                     artifact_id=artifact_id,
+                    citations=citations,
                 )
             except Exception as exc:
                 last_error = (
@@ -240,10 +271,12 @@ def _summarize(name: str, data: Any, text: str) -> str:
             return f"{data.get('expression')} = {data.get('formatted') or data.get('result')}"
         if name == "search":
             results = data.get("results") or []
+            reachable = data.get("reachable_count")
             titles = "；".join(
                 str(item.get("title")) for item in results[:3] if isinstance(item, dict)
             )
-            return f"搜索到 {len(results)} 条结果：{titles}"[:500]
+            suffix = f"，可达 {reachable} 条" if isinstance(reachable, int) else ""
+            return f"搜索到 {len(results)} 条结果{suffix}：{titles}"[:500]
         if name == "todo":
             todo = data.get("todo")
             if isinstance(todo, dict):

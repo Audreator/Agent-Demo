@@ -91,9 +91,13 @@ function confirmDelete(event: MouseEvent, session: SessionInfo): void {
       </div>
     </div>
 
+    <slot name="tools"></slot>
+
     <div class="sidebar-footer">
       <span class="status-dot" :class="{ on: !disabled }"></span>
       {{ disabled ? 'Agent 正在运行' : 'dev-user · 就绪' }}
     </div>
+
+    <router-link class="admin-entry" to="/admin">管理后台 →</router-link>
   </aside>
 </template>

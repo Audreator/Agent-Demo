@@ -86,6 +86,7 @@ class ChatProvider:
             "model": self.config.model,
             "messages": messages,
             "stream": True,
+            "stream_options": {"include_usage": True},
             "temperature": temperature,
         }
         if tools:

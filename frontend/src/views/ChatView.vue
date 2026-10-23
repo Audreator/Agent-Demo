@@ -3,6 +3,7 @@ import { computed, nextTick, onMounted, ref } from 'vue'
 import { storeToRefs } from 'pinia'
 import SessionList from '@/components/SessionList.vue'
 import MessageStream from '@/components/MessageStream.vue'
+import ToolPanel from '@/components/ToolPanel.vue'
 import { useChatStore } from '@/stores/chat'
 
 const store = useChatStore()
@@ -97,7 +98,11 @@ async function createSession(): Promise<void> {
       @select="store.selectSession"
       @create="createSession"
       @delete="store.deleteSession"
-    />
+    >
+      <template #tools>
+        <ToolPanel />
+      </template>
+    </SessionList>
 
     <main class="chat-panel">
       <header class="chat-header">
@@ -125,7 +130,7 @@ async function createSession(): Promise<void> {
         <button type="button" @click="store.error = ''">关闭</button>
       </div>
 
-      <MessageStream :messages="messages" :sending="sending" />
+      <MessageStream :messages="messages" :sending="sending" :session-id="currentSessionId" />
 
       <footer class="composer">
         <div v-if="!currentSessionId" class="composer-hint">

@@ -204,6 +204,7 @@ class MCPClient:
         user_id: str | None = None,
         session_id: str | None = None,
         tool_call_id: str | None = None,
+        timeout: float | None = None,
     ) -> dict[str, Any]:
         params: dict[str, Any] = {"name": name, "arguments": arguments}
         meta: dict[str, Any] = {}
@@ -215,7 +216,7 @@ class MCPClient:
             meta["tool_call_id"] = tool_call_id
         if meta:
             params["_meta"] = meta
-        return await self.call("tools/call", params)
+        return await self.call("tools/call", params, timeout=timeout)
 
     async def close(self) -> None:
         proc = self._proc

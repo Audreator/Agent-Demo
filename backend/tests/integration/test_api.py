@@ -32,6 +32,7 @@ async def test_api_contract(settings: Settings) -> None:
             assert tool_names == {"calculator", "todo", "search", "weather", "read_docs"}
             for tool in tools.json():
                 assert tool["inputSchema"]["type"] == "object"
+                assert tool["online"] is True
 
             created = await client.post("/api/sessions", json={"title": "API 会话"})
             assert created.status_code == 201
@@ -126,6 +127,26 @@ async def test_api_contract(settings: Settings) -> None:
             assert deleted.status_code == 204
             missing = await client.get(f"/api/sessions/{session_id}/messages")
             assert missing.status_code == 404
+
+
+async def test_tools_offline_when_mcp_stopped(settings: Settings) -> None:
+    gateway = ModelGateway(settings, providers=[EchoProvider()], tracer=get_tracer(settings))
+    app = create_app(
+        settings,
+        gateway=gateway,
+        mcp=FakeMCP(started=False),
+        auto_start_mcp=False,
+    )
+    async with app.router.lifespan_context(app):
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(
+            transport=transport, base_url="http://testserver"
+        ) as client:
+            response = await client.get("/api/tools")
+            assert response.status_code == 200
+            tools = response.json()
+            assert len(tools) == 5
+            assert all(tool["online"] is False for tool in tools)
 
 
 async def test_send_to_unknown_session_returns_404(settings: Settings) -> None:

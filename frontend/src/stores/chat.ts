@@ -1,33 +1,160 @@
 import { defineStore } from 'pinia'
+import { api, isHttpUrl } from '@/api/client'
 import { postMessageStream } from '@/api/sse'
-import type { ApiMessage, ChatMessage, SessionInfo, SseFrame, ToolCallView } from '@/types'
+import type {
+  ApiMessage,
+  ChatMessage,
+  Citation,
+  FeedbackSummary,
+  SessionInfo,
+  SseFrame,
+  ToolCallApi,
+  ToolCallView,
+} from '@/types'
 
 interface StreamState {
   aborted: boolean
   done: boolean
 }
 
-const newId = (): string =>
-  typeof crypto !== 'undefined' && 'randomUUID' in crypto
-    ? crypto.randomUUID()
-    : `local-${Date.now()}-${Math.random().toString(16).slice(2)}`
+const newId = (): string => {
+  const raw =
+    typeof crypto !== 'undefined' && 'randomUUID' in crypto
+      ? crypto.randomUUID()
+      : `${Date.now()}-${Math.random().toString(16).slice(2)}`
+  return `local-${raw}`
+}
 
-async function api<T>(path: string, init?: RequestInit): Promise<T> {
-  const response = await fetch(path, {
-    ...init,
-    headers: {
-      'Content-Type': 'application/json',
-      ...(init?.headers ?? {}),
-    },
-  })
-  if (!response.ok) {
-    const detail = await response.text()
-    throw new Error(detail || `请求失败 (${response.status})`)
+function mergeCitationArrays(existing: Citation[], incoming: Citation[]): Citation[] {
+  const seen = new Set<string>()
+  const merged: Citation[] = []
+  for (const item of [...existing, ...incoming]) {
+    if (!isHttpUrl(item.url) || seen.has(item.url)) {
+      continue
+    }
+    seen.add(item.url)
+    merged.push(item)
+    if (merged.length >= 10) {
+      break
+    }
   }
-  if (response.status === 204) {
-    return undefined as T
+  return merged
+}
+
+function toTurnTools(tools: ToolCallView[], sessionId: string, turnNo: number): ToolCallApi[] {
+  return tools.map((tool) => ({
+    id: tool.id,
+    session_id: sessionId,
+    turn_no: turnNo,
+    tool_name: tool.name,
+    arguments: tool.arguments,
+    status: tool.status,
+    retry_count: Math.max(0, (tool.attempts ?? 1) - 1),
+    latency_ms: tool.latency_ms ?? 0,
+    result_summary: tool.summary ?? null,
+    result_ref: tool.result_ref ?? null,
+    result_meta: tool.citations?.length ? { citations: tool.citations } : {},
+    error: tool.error ?? null,
+    created_at: new Date().toISOString(),
+  }))
+}
+
+function finishKind(reason: string): string | null {
+  if (!reason) {
+    return null
   }
-  return (await response.json()) as T
+  if (reason === 'final_answer') {
+    return 'final'
+  }
+  if (
+    ['max_model_calls', 'max_task_turns', 'max_tool_iterations', 'recoverable_limit'].includes(
+      reason,
+    )
+  ) {
+    return 'wrap_up'
+  }
+  if (reason === 'budget_exceeded' || reason === 'parse_error') {
+    return reason
+  }
+  if (reason === 'error' || reason === 'model_unavailable') {
+    return 'error'
+  }
+  return null
+}
+
+function normalizeCitations(value: unknown): Citation[] {
+  if (!Array.isArray(value)) {
+    return []
+  }
+  const result: Citation[] = []
+  for (const item of value) {
+    if (!item || typeof item !== 'object') {
+      continue
+    }
+    const record = item as Record<string, unknown>
+    const url = typeof record.url === 'string' ? record.url : ''
+    if (!isHttpUrl(url)) {
+      continue
+    }
+    result.push({
+      id: String(record.id ?? ''),
+      title: String(record.title ?? ''),
+      url,
+      snippet: String(record.snippet ?? ''),
+      reachable: Boolean(record.reachable),
+      status_code:
+        typeof record.status_code === 'number' ? record.status_code : null,
+      checked_at: typeof record.checked_at === 'string' ? record.checked_at : null,
+      reason: typeof record.reason === 'string' ? record.reason : '',
+    })
+  }
+  return result
+}
+
+function mergeCitations(tools: ToolCallApi[]): Citation[] {
+  const seen = new Set<string>()
+  const merged: Citation[] = []
+  for (const tool of tools) {
+    for (const item of tool.result_meta?.citations ?? []) {
+      if (!isHttpUrl(item.url) || seen.has(item.url)) {
+        continue
+      }
+      seen.add(item.url)
+      merged.push(item)
+      if (merged.length >= 10) {
+        return merged
+      }
+    }
+  }
+  return merged
+}
+
+function decorateMessages(
+  messages: ApiMessage[],
+  toolCalls: ToolCallApi[],
+): ChatMessage[] {
+  const grouped = new Map<number, ToolCallApi[]>()
+  for (const call of toolCalls) {
+    const list = grouped.get(call.turn_no) ?? []
+    list.push(call)
+    grouped.set(call.turn_no, list)
+  }
+  const display = messages.map(toDisplayMessage)
+  const terminals = new Map<number, ChatMessage>()
+  for (const message of display) {
+    if (message.role === 'assistant') {
+      terminals.set(message.turn_no, message)
+    }
+  }
+  for (const [turnNo, tools] of grouped) {
+    const terminal = terminals.get(turnNo)
+    if (!terminal) {
+      continue
+    }
+    terminal.turnTools = tools
+    terminal.citations = mergeCitations(tools)
+  }
+  return display
 }
 
 function toDisplayMessage(message: ApiMessage): ChatMessage {
@@ -39,6 +166,7 @@ function toDisplayMessage(message: ApiMessage): ChatMessage {
     meta: message.meta ?? {},
     created_at: message.created_at,
     thought: typeof message.meta?.thought === 'string' ? message.meta.thought : undefined,
+    feedback: (message.feedback ?? null) as FeedbackSummary | null,
     errorNote:
       message.meta?.kind === 'parse_error' && typeof message.meta?.reason === 'string'
         ? message.meta.reason
@@ -100,12 +228,15 @@ export const useChatStore = defineStore('chat', {
     async loadMessages(sessionId: string, token?: number) {
       this.loadingMessages = true
       try {
-        const messages = await api<ApiMessage[]>(`/api/sessions/${sessionId}/messages`)
+        const [messages, toolCalls] = await Promise.all([
+          api<ApiMessage[]>(`/api/sessions/${sessionId}/messages`),
+          api<ToolCallApi[]>(`/api/sessions/${sessionId}/tool-calls`).catch(() => []),
+        ])
         if (
           this.currentSessionId === sessionId &&
           (token === undefined || token === this.messageLoadToken)
         ) {
-          this.messages = messages.map(toDisplayMessage)
+          this.messages = decorateMessages(messages, toolCalls)
         }
       } finally {
         if (token === undefined || token === this.messageLoadToken) {
@@ -213,7 +344,7 @@ export const useChatStore = defineStore('chat', {
         if (this.connection !== 'error') {
           this.connection = 'idle'
         }
-        if (!controller.signal.aborted && (!this.streamState.done || this.error)) {
+        if (!controller.signal.aborted && sessionId === this.currentSessionId) {
           try {
             await this.loadMessages(sessionId, this.messageLoadToken)
           } catch {
@@ -269,8 +400,17 @@ export const useChatStore = defineStore('chat', {
           break
         }
         case 'tool_start': {
+          const toolId = String(data.tool_call_id ?? newId())
+          const existing = (assistant.tools ?? []).find((item) => item.id === toolId)
+          if (existing) {
+            existing.name = String(data.name ?? existing.name)
+            existing.arguments =
+              (data.arguments as Record<string, unknown>) ?? existing.arguments
+            existing.status = 'running'
+            break
+          }
           const tool: ToolCallView = {
-            id: String(data.tool_call_id ?? newId()),
+            id: toolId,
             name: String(data.name ?? 'tool'),
             arguments: (data.arguments as Record<string, unknown>) ?? {},
             status: 'running',
@@ -290,6 +430,14 @@ export const useChatStore = defineStore('chat', {
             target.result_ref =
               typeof data.result_ref === 'string' ? data.result_ref : target.result_ref
             target.attempts = typeof data.attempts === 'number' ? data.attempts : target.attempts
+            if (Array.isArray(data.citations)) {
+              const incoming = normalizeCitations(data.citations)
+              target.citations = mergeCitationArrays(target.citations ?? [], incoming)
+              assistant.citations = mergeCitationArrays(
+                assistant.citations ?? [],
+                incoming,
+              )
+            }
           }
           break
         }
@@ -322,9 +470,25 @@ export const useChatStore = defineStore('chat', {
           break
         }
         case 'done': {
+          const reason = String(data.finish_reason ?? '')
           this.streamState.done = true
-          assistant.finishReason = String(data.finish_reason ?? '')
+          assistant.finishReason = reason
           assistant.streaming = false
+          const kind = finishKind(reason)
+          if (kind) {
+            assistant.meta.kind = kind
+          }
+          if (assistant.tools?.length) {
+            assistant.turnTools = toTurnTools(
+              assistant.tools,
+              this.currentSessionId ?? '',
+              assistant.turn_no,
+            )
+            assistant.citations = mergeCitationArrays(
+              assistant.citations ?? [],
+              assistant.turnTools.flatMap((tool) => tool.result_meta?.citations ?? []),
+            )
+          }
           break
         }
         default:

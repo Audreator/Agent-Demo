@@ -2,11 +2,15 @@
 import { computed, nextTick, ref, watch } from 'vue'
 import ThoughtPanel from './ThoughtPanel.vue'
 import ToolCallCard from './ToolCallCard.vue'
+import ToolSummary from './ToolSummary.vue'
+import CitationList from './CitationList.vue'
+import FeedbackBar from './FeedbackBar.vue'
 import type { ChatMessage, ToolCallView } from '@/types'
 
 const props = defineProps<{
   messages: ChatMessage[]
   sending: boolean
+  sessionId: string | null
 }>()
 
 const scroller = ref<HTMLElement | null>(null)
@@ -15,7 +19,17 @@ const pinned = ref(true)
 const displayMessages = computed(() =>
   props.messages.filter((message) => {
     if (message.role === 'assistant' && !message.content && !message.thought?.trim()) {
-      return Boolean(message.errorNote || message.tools?.length || message.streaming || message.contextNote)
+      return Boolean(
+        message.errorNote ||
+          message.tools?.length ||
+          message.turnTools?.length ||
+          message.citations?.length ||
+          message.feedback?.rating ||
+          message.streaming ||
+          message.contextNote ||
+          message.meta.kind === 'final' ||
+          message.meta.kind === 'wrap_up',
+      )
     }
     return true
   }),
@@ -32,6 +46,21 @@ function toolFromMessage(message: ChatMessage): ToolCallView {
     latency_ms: typeof meta.latency_ms === 'number' ? meta.latency_ms : undefined,
     result_ref: (meta.result_ref as string | null | undefined) ?? null,
   }
+}
+
+function isTurnEnd(message: ChatMessage): boolean {
+  return message.role === 'assistant' && !message.streaming
+}
+
+function isRateable(message: ChatMessage): boolean {
+  return (
+    isTurnEnd(message) &&
+    (message.meta.kind === 'final' || message.meta.kind === 'wrap_up')
+  )
+}
+
+function isPersisted(message: ChatMessage): boolean {
+  return !message.id.startsWith('local-')
 }
 
 function onScroll(): void {
@@ -96,6 +125,24 @@ watch(
           输出协议异常：{{ message.errorNote }}
         </div>
         <div v-if="message.contextNote" class="context-note">{{ message.contextNote }}</div>
+        <ToolSummary
+          v-if="isTurnEnd(message) && (message.turnTools?.length ?? 0) > 0 && props.sessionId"
+          :tools="message.turnTools ?? []"
+          :citations="message.citations ?? []"
+          :session-id="props.sessionId"
+        />
+        <CitationList
+          v-if="isTurnEnd(message) && (message.citations?.length ?? 0) > 0 && props.sessionId"
+          :citations="message.citations ?? []"
+          :session-id="props.sessionId"
+          :turn-no="message.turn_no"
+        />
+        <FeedbackBar
+          v-if="isRateable(message) && isPersisted(message) && props.sessionId"
+          :session-id="props.sessionId"
+          :message-id="message.id"
+          :feedback="message.feedback ?? null"
+        />
         <div
           v-if="message.streaming && !message.content && !message.thought && !message.tools?.length"
           class="bubble assistant-bubble placeholder"

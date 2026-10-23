@@ -129,5 +129,11 @@ async def test_real_search_tool_via_mcp(settings: Settings) -> None:
         assert all(
             item["url"].startswith("http") for item in payload["results"]
         )
+        assert payload["citations"]
+        assert all(item["id"] and item["url"] for item in payload["citations"])
+        reachable = sum(1 for item in payload["citations"] if item["reachable"])
+        if reachable == 0:
+            pytest.skip("真实链接校验全部失败，按需求允许网络原因跳过")
+        assert reachable >= 1
     finally:
         await mcp.close()

@@ -28,6 +28,7 @@ from app.errors import (
     TaskTurnLimitError,
 )
 from app.mcp.client import MCPClient
+from app.mcp.tools.artifacts import ArtifactError, read_artifact
 from app.models.db_models import Artifact, Message, Session, utcnow
 from app.models.gateway import ModelGateway
 from app.models.providers import ChatChunk, ModelResult
@@ -232,9 +233,12 @@ class AgentLoop:
                 content=user_text,
                 token_est=estimate_tokens(user_text),
                 meta=(
-                    {"client_message_id": client_message_id}
+                    {
+                        "client_message_id": client_message_id,
+                        "trace_id": current_trace_id(),
+                    }
                     if client_message_id
-                    else {}
+                    else {"trace_id": current_trace_id()}
                 ),
             )
             assert user_message is not None
@@ -608,6 +612,37 @@ class AgentLoop:
                         "latency_ms": 0,
                     },
                 )
+                blocked_row = await repo.add_tool_call(
+                    session_id=state.session.id,
+                    turn_no=state.turn_no,
+                    tool_name=parsed.name,
+                    arguments=parsed.arguments,
+                    status="blocked",
+                    result_summary=None,
+                    result_ref=None,
+                    error=observation,
+                    latency_ms=0,
+                    idempotency_key=parsed.arguments.get("client_op_id"),
+                    call_id=uuid.UUID(hex=blocked_call_id),
+                )
+                blocked_row.result_meta = {}
+                if not state.task_counted:
+                    session.task_turn_count = int(session.task_turn_count) + 1
+                    state.task_counted = True
+                state.tool_events.append(
+                    {
+                        "tool_call_id": blocked_call_id,
+                        "name": parsed.name,
+                        "status": "blocked",
+                        "summary": None,
+                        "error": observation,
+                        "latency_ms": 0,
+                        "result_ref": None,
+                        "attempts": 0,
+                        "turn_no": state.turn_no,
+                    }
+                )
+                await db.commit()
                 self._append_action_observation(
                     state, result, parsed, blocked_call_id, observation
                 )
@@ -661,6 +696,7 @@ class AgentLoop:
                 latency_ms=0,
                 idempotency_key=parsed.arguments.get("client_op_id"),
                 message_id=action_message.id,
+                call_id=uuid.UUID(hex=tool_call_id),
             )
             await db.commit()
             tool_result = await self.executor.execute(
@@ -683,7 +719,7 @@ class AgentLoop:
             if tool_result.artifact_id:
                 await self._save_artifact_row(db, state, tool_result, tool_call_id)
             await self._save_tool_message(repo, state, tool_result, tool_call_id)
-            event = {
+            event: dict[str, Any] = {
                 "tool_call_id": tool_call_id,
                 "name": parsed.name,
                 "status": "ok" if tool_result.ok else "error",
@@ -693,6 +729,8 @@ class AgentLoop:
                 "result_ref": tool_result.result_ref,
                 "attempts": tool_result.attempts,
             }
+            if parsed.name == "search":
+                event["citations"] = tool_result.citations
             state.tool_events.append(
                 {
                     **event,
@@ -870,13 +908,14 @@ class AgentLoop:
         content: str,
         meta: dict[str, Any],
     ) -> Message:
+        payload = {"trace_id": current_trace_id(), **meta}
         return await repo.add_message(
             session_id=state.session.id,
             turn_no=state.turn_no,
             role="assistant",
             content=content,
             token_est=estimate_tokens(content),
-            meta=meta,
+            meta=payload,
         )
 
     async def _save_tool_message(
@@ -895,6 +934,7 @@ class AgentLoop:
             token_est=estimate_tokens(content),
             meta={
                 "type": "tool_result",
+                "trace_id": current_trace_id(),
                 "tool_call_id": tool_call_id,
                 "tool_name": result.name,
                 "status": "ok" if result.ok else "error",
@@ -930,7 +970,9 @@ class AgentLoop:
                 latency_ms=latency,
                 idempotency_key=(result.arguments or {}).get("client_op_id"),
                 retry_count=max(0, result.attempts - 1),
+                call_id=uuid.UUID(hex=tool_call_id),
             )
+            row.result_meta = self._result_meta(result)
             return
         row.tool_name = parsed.name
         row.arguments = result.arguments or parsed.arguments
@@ -941,7 +983,18 @@ class AgentLoop:
         row.latency_ms = latency
         row.idempotency_key = (result.arguments or {}).get("client_op_id")
         row.retry_count = max(0, result.attempts - 1)
+        row.result_meta = self._result_meta(result)
         await repo.db.flush()
+
+    @staticmethod
+    def _result_meta(result: ToolExecutionResult) -> dict[str, Any]:
+        if result.name != "search":
+            return {}
+        return {
+            "citations": result.citations,
+            "reachable_count": sum(1 for item in result.citations if item.get("reachable")),
+            "checked_at": utcnow().isoformat(),
+        }
 
     async def _save_artifact_row(
         self,
@@ -952,13 +1005,23 @@ class AgentLoop:
     ) -> None:
         if not result.artifact_id:
             return
+        content = result.content
+        if result.result_ref and result.result_ref.startswith("artifact://"):
+            try:
+                content = read_artifact(
+                    result.result_ref,
+                    session_id=str(state.session.id),
+                    base_dir=self.settings.artifacts_dir,
+                )
+            except ArtifactError:
+                content = result.content
         db.add(
             Artifact(
                 id=result.artifact_id,
                 session_id=state.session.id,
                 tool_call_id=tool_call_id,
-                size=len(result.content),
-                content=result.content,
+                size=len(content),
+                content=content,
             )
         )
         await db.flush()
@@ -975,6 +1038,7 @@ class AgentLoop:
     ) -> AgentRunResult:
         session = state.session
         answer = ""
+        last_result: ModelResult | None = None
         splitter = StreamSplitter(session.mode, emit)
         over_budget = bool(
             state.bundle
@@ -996,6 +1060,7 @@ class AgentLoop:
                     on_reset=splitter.reset,
                     max_tokens=self.settings.max_output_tokens,
                 )
+                last_result = result
                 state.model_calls += 1
                 parsed = self._parse(session.mode, result, registry)
                 if parsed.kind == "final":
@@ -1008,11 +1073,20 @@ class AgentLoop:
             await emit("message_delta", {"delta": answer})
         elif splitter.message_chars == 0:
             await emit("message_delta", {"delta": answer})
+        meta: dict[str, Any] = {"kind": "wrap_up", "reason": reason}
+        if last_result is not None:
+            meta.update(
+                {
+                    "provider": last_result.provider,
+                    "layer": last_result.layer,
+                    "usage": last_result.usage,
+                }
+            )
         await self._save_assistant(
             repo,
             state,
             content=answer,
-            meta={"kind": "wrap_up", "reason": reason},
+            meta=meta,
         )
         try:
             await state_manager.update_after_turn(

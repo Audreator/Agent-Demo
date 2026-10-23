@@ -50,6 +50,7 @@ class FakeMCP:
         user_id: str | None = None,
         session_id: str | None = None,
         tool_call_id: str | None = None,
+        timeout: float | None = None,
     ) -> dict[str, Any]:
         self.calls.append((name, arguments, {"user_id": user_id, "session_id": session_id}))
         if name in self.fail_tools:

@@ -141,11 +141,17 @@ class ModelGateway:
             if not provider.config.configured:
                 continue
             breaker = self.breakers[provider.name]
+            was_open = breaker.state == "open"
             if not breaker.allow():
                 await self._record(
                     "breaker_skip", {"provider": provider.name, "state": breaker.state}
                 )
                 continue
+            probe = breaker.state == "half_open" and breaker.probe_inflight
+            if was_open and breaker.state == "half_open":
+                await self._record(
+                    "breaker_half_open", {"provider": provider.name}
+                )
             text_parts: list[str] = []
             reasoning_parts: list[str] = []
             tool_calls: dict[int, dict[str, Any]] = {}
@@ -189,6 +195,10 @@ class ModelGateway:
                             usage=usage,
                         )
                     breaker.on_success()
+                    if probe:
+                        await self._record(
+                            "breaker_probe_success", {"provider": provider.name}
+                        )
                     await self._record(
                         "model_success",
                         {
@@ -212,6 +222,14 @@ class ModelGateway:
                     if emitted and on_reset is not None:
                         await on_reset()
                     breaker.on_failure()
+                    if probe:
+                        await self._record(
+                            "breaker_probe_failure", {"provider": provider.name}
+                        )
+                    await self._record(
+                        "breaker_open",
+                        {"provider": provider.name, "reason": "permanent_failure"},
+                    )
                     await self._record(
                         "model_permanent_failure",
                         {
@@ -236,6 +254,15 @@ class ModelGateway:
                     if emitted:
                         if on_reset is None:
                             breaker.on_failure()
+                            if probe:
+                                await self._record(
+                                    "breaker_probe_failure",
+                                    {"provider": provider.name},
+                                )
+                            await self._record(
+                                "breaker_open",
+                                {"provider": provider.name, "reason": "stream_interrupted"},
+                            )
                             raise ServiceUnavailableError(
                                 "模型流式输出中断，请重试本轮请求"
                             ) from exc
@@ -249,6 +276,10 @@ class ModelGateway:
                         await self._sleep(delay)
                         continue
                     breaker.on_failure()
+                    if probe:
+                        await self._record(
+                            "breaker_probe_failure", {"provider": provider.name}
+                        )
                     await self._record(
                         "breaker_open", {"provider": provider.name, "reason": "retries_exhausted"}
                     )
@@ -267,6 +298,14 @@ class ModelGateway:
                         await self._sleep(self._retry_delay(attempt, last_error))
                         continue
                     breaker.on_failure()
+                    if probe:
+                        await self._record(
+                            "breaker_probe_failure", {"provider": provider.name}
+                        )
+                    await self._record(
+                        "breaker_open",
+                        {"provider": provider.name, "reason": "unknown_failure"},
+                    )
                     break
             await self._record(
                 "model_degrade", {"from": provider.name, "reason": str(last_error)}

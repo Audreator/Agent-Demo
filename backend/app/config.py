@@ -69,6 +69,26 @@ class Settings(BaseSettings):
     mcp_command: str = ""
     mcp_timeout: float = 30.0
 
+    # T26102201: citations, feedback and admin console
+    admin_max_range_days: int = 90
+    admin_page_size: int = 50
+    admin_export_max_rows: int = 10_000
+    citation_display_limit: int = 3
+    citation_max_total: int = 10
+    link_check_timeout: float = 8.0
+    link_check_concurrency: int = 5
+    link_check_cache_ttl: int = 600
+    events_retention_days: int = 90
+    feedback_reason_max: int = 200
+    admin_alert_tool_failure_rate: float = 0.2
+    admin_alert_min_tool_calls: int = 10
+    admin_alert_satisfaction_rate: float = 0.7
+    admin_alert_min_feedbacks: int = 5
+    admin_alert_p95_ms: int = 60_000
+    admin_alert_min_turns: int = 10
+    admin_alert_breaker_count: int = 1
+    admin_alert_wrap_count: int = 3
+
     @field_validator("agent_md_path", mode="before")
     @classmethod
     def _empty_path_to_none(cls, value: object) -> object:
@@ -129,6 +149,10 @@ class Settings(BaseSettings):
         env["DEEPSEEK_SEARCH_BASE_URL"] = self.deepseek_search_base_url
         env["DEEPSEEK_SEARCH_API_KEY"] = self.deepseek_search_api_key
         env["DEEPSEEK_SEARCH_MODEL"] = self.deepseek_search_model
+        env["CITATION_MAX_TOTAL"] = str(self.citation_max_total)
+        env["LINK_CHECK_TIMEOUT"] = str(self.link_check_timeout)
+        env["LINK_CHECK_CONCURRENCY"] = str(self.link_check_concurrency)
+        env["LINK_CHECK_CACHE_TTL"] = str(self.link_check_cache_ttl)
         env["MODEL_L1_BASE_URL"] = self.model_l1_base_url
         env["MODEL_L1_API_KEY"] = self.model_l1_api_key
         env["MODEL_L1_NAME"] = self.model_l1_name

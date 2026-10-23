@@ -11,8 +11,13 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.agent.loop import AgentLoop
+from app.api import admin as admin_api
+from app.api import citations as citations_api
+from app.api import feedback as feedback_api
+from app.api import tool_calls as tool_calls_api
 from app.api.routes import router
 from app.api.sse import StreamRegistry
+from app.citations import LinkCheckCache
 from app.config import BASE_DIR, Settings, get_settings
 from app.db import get_sessionmaker, run_migrations
 from app.mcp.client import MCPClient
@@ -29,6 +34,7 @@ class AppState:
     loop: AgentLoop
     streams: StreamRegistry
     tools: list[dict[str, Any]]
+    link_cache: LinkCheckCache
     session_locks: dict[str, asyncio.Lock] = field(default_factory=dict)
 
 
@@ -70,6 +76,7 @@ def create_app(
             loop=loop,
             streams=StreamRegistry(),
             tools=tools,
+            link_cache=LinkCheckCache(ttl=settings.link_check_cache_ttl),
             session_locks={},
         )
         logger.info(
@@ -96,6 +103,10 @@ def create_app(
         allow_headers=["*"],
     )
     app.include_router(router, prefix="/api")
+    app.include_router(feedback_api.router, prefix="/api")
+    app.include_router(tool_calls_api.router, prefix="/api")
+    app.include_router(citations_api.router, prefix="/api")
+    app.include_router(admin_api.router, prefix="/api")
     return app
 
 

@@ -16,6 +16,7 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
     Uuid,
+    text,
 )
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.ext.mutable import MutableDict, MutableList
@@ -85,7 +86,10 @@ class Message(Base):
 
 class ToolCall(Base):
     __tablename__ = "tool_calls"
-    __table_args__ = (Index("ix_tool_calls_session", "session_id", "turn_no"),)
+    __table_args__ = (
+        Index("ix_tool_calls_session", "session_id", "turn_no"),
+        Index("ix_tool_calls_created", "created_at"),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=new_uuid)
     session_id: Mapped[uuid.UUID] = mapped_column(
@@ -101,11 +105,46 @@ class ToolCall(Base):
     retry_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     result_summary: Mapped[str | None] = mapped_column(Text, nullable=True)
     result_ref: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    result_meta: Mapped[dict[str, Any]] = mapped_column(
+        MutableDict.as_mutable(JSONB),
+        nullable=False,
+        default=dict,
+        server_default=text("'{}'::jsonb"),
+    )
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
     latency_ms: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     idempotency_key: Mapped[str | None] = mapped_column(String(128), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, default=utcnow
+    )
+
+
+class MessageFeedback(Base):
+    __tablename__ = "message_feedback"
+    __table_args__ = (
+        UniqueConstraint("message_id", "user_id", name="uq_feedback_message_user"),
+        Index("ix_feedback_session_created", "session_id", "created_at"),
+        Index("ix_feedback_rating_created", "rating", "created_at"),
+        Index("ix_feedback_reason", "reason_code"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=new_uuid)
+    message_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("messages.id", ondelete="CASCADE"), nullable=False
+    )
+    session_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("sessions.id", ondelete="CASCADE"), nullable=False
+    )
+    user_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    rating: Mapped[str] = mapped_column(String(8), nullable=False)
+    reason_code: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    reason_text: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    trace_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=utcnow
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=utcnow, onupdate=utcnow
     )
 
 
@@ -198,6 +237,7 @@ class Event(Base):
     __table_args__ = (
         Index("ix_events_trace", "trace_id", "ts"),
         Index("ix_events_session", "session_id", "ts"),
+        Index("ix_events_kind_ts", "kind", "ts"),
     )
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
@@ -261,6 +301,7 @@ __all__ = [
     "Base",
     "Event",
     "Message",
+    "MessageFeedback",
     "Session",
     "Snapshot",
     "StateCard",

@@ -43,7 +43,11 @@ def _extract_responses_results(data: dict[str, Any]) -> list[dict[str, Any]]:
                 )
                 if not title or not url:
                     continue
-                if urlparse(str(url)).scheme not in {"http", "https"}:
+                try:
+                    scheme = urlparse(str(url)).scheme
+                except (ValueError, UnicodeError):
+                    continue
+                if scheme not in {"http", "https"}:
                     continue
                 snippet = ""
                 start = annotation.get("start_index")

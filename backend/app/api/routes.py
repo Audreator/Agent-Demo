@@ -11,11 +11,13 @@ from fastapi.responses import StreamingResponse
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.api.feedback import feedback_summaries
 from app.api.sse import SSEEmitter, encode_sse, replay_events, stream_buffer
 from app.db import get_db
 from app.models.db_models import Event, Message, Session
 from app.sessions.repository import SessionRepository
 from app.sessions.schemas import (
+    FeedbackSummaryOut,
     MessageOut,
     SendMessageRequest,
     SessionCreate,
@@ -76,12 +78,21 @@ async def create_session(
 @router.get("/sessions/{session_id}/messages", response_model=list[MessageOut])
 async def list_messages(
     session_id: UUID, db: DbSession, request: Request
-) -> list[Message]:
+) -> list[MessageOut]:
     repo = _repo(db, request)
     session = await repo.get(session_id)
     if session is None:
         raise HTTPException(status_code=404, detail="会话不存在")
-    return await repo.list_messages(session_id)
+    messages = await repo.list_messages(session_id)
+    feedback_map = await feedback_summaries(
+        db, [message.id for message in messages], repo.user_id
+    )
+    result: list[MessageOut] = []
+    for message in messages:
+        item = MessageOut.model_validate(message)
+        item.feedback = feedback_map.get(message.id, FeedbackSummaryOut())
+        result.append(item)
+    return result
 
 
 @router.delete("/sessions/{session_id}", status_code=204)
@@ -100,32 +111,84 @@ async def delete_session(session_id: UUID, db: DbSession, request: Request) -> R
     return Response(status_code=204)
 
 
+@router.get("/config")
+async def get_config(request: Request) -> dict[str, Any]:
+    settings = _state(request).settings
+    return {
+        "citation_display_limit": settings.citation_display_limit,
+        "citation_max_total": settings.citation_max_total,
+        "feedback_reason_max": min(settings.feedback_reason_max, 200),
+        "admin_page_size": settings.admin_page_size,
+    }
+
+
 @router.get("/tools", response_model=list[ToolInfo])
 async def list_tools(request: Request) -> list[dict[str, Any]]:
     state = _state(request)
-    if not state.tools:
+    online = False
+    if state.mcp.started:
         try:
             state.tools = await state.mcp.list_tools()
-        except Exception as exc:
-            raise HTTPException(status_code=503, detail=f"工具服务不可用: {exc}") from exc
+            online = True
+        except Exception:
+            online = False
+    if not state.tools:
+        from app.mcp.server import TOOLS
+
+        state.tools = [
+            {
+                "name": tool["name"],
+                "description": tool["description"],
+                "inputSchema": tool["inputSchema"],
+            }
+            for tool in TOOLS.values()
+        ]
     return [
         {
             "name": tool["name"],
             "description": tool.get("description", ""),
             "inputSchema": tool.get("inputSchema", {}),
+            "online": online,
         }
         for tool in state.tools
     ]
 
 
 @router.get("/traces/{trace_id}", response_model=list[TraceEvent])
-async def get_trace(trace_id: str, db: DbSession) -> list[Event]:
+async def get_trace(trace_id: str, db: DbSession, request: Request) -> list[Event]:
     stmt = (
         select(Event)
         .where(Event.trace_id == trace_id)
         .order_by(Event.ts.asc(), Event.id.asc())
     )
-    return list((await db.execute(stmt)).scalars().all())
+    events = list((await db.execute(stmt)).scalars().all())
+    if not events:
+        return events
+    settings = _state(request).settings
+    session_ids: set[UUID] = set()
+    for event in events:
+        if event.session_id:
+            try:
+                session_ids.add(UUID(str(event.session_id)))
+            except ValueError:
+                continue
+    if not session_ids:
+        raise HTTPException(status_code=404, detail="调用链不存在")
+    owned = set(
+        (
+            await db.execute(
+                select(Session.id).where(
+                    Session.id.in_(session_ids),
+                    Session.user_id == settings.dev_user_id,
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    if owned != session_ids:
+        raise HTTPException(status_code=404, detail="调用链不存在")
+    return events
 
 
 @router.post("/sessions/{session_id}/messages")

@@ -172,6 +172,7 @@ class SessionRepository:
         idempotency_key: str | None,
         retry_count: int = 0,
         message_id: UUID | None = None,
+        call_id: UUID | None = None,
     ) -> ToolCall:
         call = ToolCall(
             session_id=session_id,
@@ -187,6 +188,8 @@ class SessionRepository:
             latency_ms=latency_ms,
             idempotency_key=idempotency_key,
         )
+        if call_id is not None:
+            call.id = call_id
         self.db.add(call)
         await self.db.flush()
         return call
