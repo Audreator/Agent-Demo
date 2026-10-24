@@ -106,6 +106,7 @@ class ModelGateway:
             providers if providers is not None else [ChatProvider(config) for config in configs]
         )
         clock_fn = clock or __import__("time").monotonic
+        self._clock = clock_fn
         self.breakers: dict[str, Breaker] = {
             provider.name: Breaker(
                 open_seconds=self.settings.breaker_open_seconds, clock=clock_fn
@@ -159,11 +160,13 @@ class ModelGateway:
 
             for attempt in range(max(1, self.settings.llm_retry)):
                 emitted = False
+                first_token_ms: int | None = None
                 text_parts.clear()
                 reasoning_parts.clear()
                 tool_calls.clear()
                 usage = {}
                 try:
+                    attempt_started = self._clock()
                     async with self.tracer.span(
                         "model_call",
                         provider=provider.name,
@@ -171,11 +174,20 @@ class ModelGateway:
                         attempt=attempt + 1,
                         mode="native" if tools else "react",
                     ) as span:
+                        span.set(first_token_ms=first_token_ms)
                         async for chunk in provider.stream(
                             messages,
                             tools=tools,
                             max_tokens=max_tokens,
                         ):
+                            if (
+                                first_token_ms is None
+                                and (chunk.content or chunk.reasoning or chunk.tool_calls)
+                            ):
+                                first_token_ms = int(
+                                    (self._clock() - attempt_started) * 1000
+                                )
+                                span.set(first_token_ms=first_token_ms)
                             if chunk.content:
                                 text_parts.append(chunk.content)
                             if chunk.reasoning:
@@ -193,6 +205,7 @@ class ModelGateway:
                             content_chars=sum(len(part) for part in text_parts),
                             reasoning_chars=sum(len(part) for part in reasoning_parts),
                             usage=usage,
+                            first_token_ms=first_token_ms,
                         )
                     breaker.on_success()
                     if probe:
@@ -206,6 +219,7 @@ class ModelGateway:
                             "layer": provider.config.layer,
                             "usage": usage,
                             "content_chars": sum(len(part) for part in text_parts),
+                            "first_token_ms": first_token_ms,
                         },
                     )
                     return ModelResult(

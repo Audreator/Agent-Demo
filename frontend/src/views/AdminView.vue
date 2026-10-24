@@ -243,6 +243,7 @@ const overviewCards = computed(() => {
     { label: '工具成功率', value: fmtPercent(item.tool_success_rate) },
     { label: '平均轮次耗时', value: fmtMs(item.avg_turn_latency_ms) },
     { label: 'P95 轮次耗时', value: fmtMs(item.p95_turn_latency_ms) },
+    { label: '首Token P95', value: fmtMs(item.p95_first_token_ms) },
     { label: '总 token', value: item.total_tokens.toLocaleString('zh-CN') },
     { label: '赞 / 踩', value: `${item.likes} / ${item.dislikes}` },
     { label: '满意率', value: fmtPercent(item.satisfaction_rate) },
@@ -409,6 +410,7 @@ onMounted(async () => {
               <th>探测成功</th>
               <th>探测失败</th>
               <th>平均耗时</th>
+              <th>首Token P95</th>
               <th>token</th>
             </tr>
           </thead>
@@ -424,6 +426,11 @@ onMounted(async () => {
               <td>{{ model.probe_success }}</td>
               <td>{{ model.probe_failure }}</td>
               <td>{{ fmtMs(model.avg_ms) }}</td>
+              <td>
+                <span :title="`有效样本 ${model.first_token_samples} 次`">
+                  {{ fmtMs(model.first_token_p95_ms) }}
+                </span>
+              </td>
               <td>{{ model.tokens.toLocaleString('zh-CN') }}</td>
             </tr>
           </tbody>

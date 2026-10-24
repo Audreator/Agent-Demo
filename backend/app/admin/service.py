@@ -8,7 +8,7 @@ from typing import Any
 from uuid import UUID
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import Float, Integer, String, Uuid, cast, exists, func, not_, select, tuple_
+from sqlalchemy import Float, Integer, String, Uuid, case, cast, exists, func, not_, select, tuple_
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.feedback import feedback_summaries
@@ -57,6 +57,15 @@ def percentile(values: list[int] | list[float], p: float) -> float | None:
     ordered = sorted(values)
     index = max(0, math.ceil(p / 100 * len(ordered)) - 1)
     return float(ordered[min(index, len(ordered) - 1)])
+
+
+def first_token_value(payload: Any) -> int | None:
+    if not isinstance(payload, dict):
+        return None
+    value = payload.get("first_token_ms")
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return int(value) if value >= 0 else None
 
 
 def _tokens(meta: dict[str, Any] | None) -> int:
@@ -201,6 +210,7 @@ async def _fetch_turn_events(
     finish_reason: str | None = None,
     limit: int | None = None,
     offset: int = 0,
+    with_payload: bool = False,
 ) -> list[Any]:
     conditions = _turn_conditions(
         settings,
@@ -213,8 +223,17 @@ async def _fetch_turn_events(
         rating=rating,
         finish_reason=finish_reason,
     )
+    columns: list[Any] = [
+        Event.trace_id,
+        Event.session_id,
+        Event.turn_no,
+        Event.ts,
+        Event.duration_ms,
+    ]
+    if with_payload:
+        columns.append(Event.payload)
     stmt = (
-        select(Event.trace_id, Event.session_id, Event.turn_no, Event.ts, Event.duration_ms)
+        select(*columns)
         .where(*conditions)
         .order_by(Event.ts.desc(), Event.id.desc())
     )
@@ -803,7 +822,9 @@ def _buckets(start: datetime, end: datetime, hourly: bool) -> list[str]:
 async def compute_metrics(
     db: AsyncSession, settings: Settings, start: datetime, end: datetime
 ) -> dict[str, Any]:
-    turn_rows = await _fetch_turn_events(db, settings, start, end)
+    turn_rows = await _fetch_turn_events(
+        db, settings, start, end, with_payload=True
+    )
     session_ids = {
         UUID(str(row.session_id)) for row in turn_rows if row.session_id
     }
@@ -877,6 +898,11 @@ async def compute_metrics(
     task_counts: Counter[str] = Counter(session_id for session_id, _ in task_keys)
     duration_map = await _turn_durations(db, turn_rows)
     durations = [value for value in duration_map.values() if value > 0]
+    turn_first_tokens = [
+        value
+        for value in (first_token_value(row.payload) for row in turn_rows)
+        if value is not None
+    ]
     ok_calls = sum(1 for call in tool_rows if call.status == "ok")
     error_calls = sum(1 for call in tool_rows if call.status == "error")
     tool_rate = _rate(ok_calls, ok_calls + error_calls)
@@ -894,6 +920,7 @@ async def compute_metrics(
         "tool_success_rate": tool_rate,
         "avg_turn_latency_ms": round(sum(durations) / len(durations), 2) if durations else None,
         "p95_turn_latency_ms": percentile(durations, 95),
+        "p95_first_token_ms": percentile(turn_first_tokens, 95),
         "total_tokens": total_tokens,
         "likes": likes,
         "dislikes": dislikes,
@@ -925,6 +952,11 @@ async def compute_metrics(
         value = duration_map.get(str(row.trace_id), 0)
         if value > 0:
             latency_by_bucket[_bucket_key(row.ts, hourly)].append(value)
+    first_token_by_bucket: dict[str, list[int]] = defaultdict(list)
+    for row in turn_rows:
+        first_token = first_token_value(row.payload)
+        if first_token is not None:
+            first_token_by_bucket[_bucket_key(row.ts, hourly)].append(first_token)
     trend = []
     for key in bucket_keys:
         tool_stats = tool_by_bucket.get(key, [0, 0])
@@ -939,6 +971,9 @@ async def compute_metrics(
                     feedback_stats[0], feedback_stats[0] + feedback_stats[1]
                 ),
                 "p95_ms": percentile(latency_by_bucket.get(key, []), 95),
+                "p95_first_token_ms": percentile(
+                    first_token_by_bucket.get(key, []), 95
+                ),
             }
         )
 
@@ -1088,6 +1123,34 @@ async def _model_metrics(
         str(layer or "unknown"): int(tokens or 0)
         for layer, tokens in (await db.execute(success_tokens_stmt)).all()
     }
+    first_token_expr = case(
+        (
+            Event.payload["first_token_ms"].astext.op("~")(r"^[0-9]+(\.[0-9]+)?$"),
+            cast(Event.payload["first_token_ms"].astext, Float),
+        ),
+        else_=None,
+    )
+    first_token_stmt = (
+        select(
+            success_layer_expr,
+            func.percentile_disc(0.95).within_group(first_token_expr),
+            func.count(first_token_expr),
+        )
+        .where(
+            Event.kind == "model_success",
+            Event.ts >= start,
+            Event.ts < end,
+            Event.session_id.is_not(None),
+            Event.session_id.in_(_session_ids(settings.dev_user_id)),
+        )
+        .group_by(success_layer_expr)
+    )
+    first_token_by_layer: dict[str, tuple[float | None, int]] = {}
+    for layer, p95, samples in (await db.execute(first_token_stmt)).all():
+        first_token_by_layer[str(layer or "unknown")] = (
+            float(p95) if p95 is not None else None,
+            int(samples or 0),
+        )
 
     layers = sorted(
         set(calls) | set(success) | set(failures) | set(degrade) | set(breaker_open),
@@ -1100,6 +1163,9 @@ async def _model_metrics(
     result: list[dict[str, Any]] = []
     for layer in layers:
         avg_ms, call_count, _ = avg_map.get(layer, (0.0, 0, 0))
+        first_token_p95, first_token_samples = first_token_by_layer.get(
+            layer, (None, 0)
+        )
         result.append(
             {
                 "layer": layer,
@@ -1113,6 +1179,8 @@ async def _model_metrics(
                 "probe_failure": probe_failure.get(layer, 0),
                 "avg_ms": round(avg_ms, 2) if avg_ms else None,
                 "tokens": success_tokens.get(layer, 0),
+                "first_token_p95_ms": first_token_p95,
+                "first_token_samples": first_token_samples,
             }
         )
     return result

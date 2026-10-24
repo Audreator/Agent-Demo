@@ -142,6 +142,7 @@ export interface TrendPoint {
   tool_success_rate: number | null
   satisfaction_rate: number | null
   p95_ms: number | null
+  p95_first_token_ms: number | null
 }
 
 export interface AdminAlert {
@@ -169,6 +170,7 @@ export interface AdminMetrics {
     tool_success_rate: number | null
     avg_turn_latency_ms: number | null
     p95_turn_latency_ms: number | null
+    p95_first_token_ms: number | null
     total_tokens: number
     likes: number
     dislikes: number
@@ -200,6 +202,8 @@ export interface AdminMetrics {
     probe_failure: number
     avg_ms: number | null
     tokens: number
+    first_token_p95_ms: number | null
+    first_token_samples: number
   }>
   context: {
     compress_count: number

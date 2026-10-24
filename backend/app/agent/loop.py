@@ -16,6 +16,12 @@ from app.agent.prompt_builder import (
 )
 from app.agent.react_parser import ParsedOutput, parse_react
 from app.agent.tool_executor import ToolExecutionResult, ToolExecutor
+from app.agent.uncertainty import (
+    FORCED_SEARCH_EMPTY_TEXT,
+    forced_search_query,
+    is_refusal_answer,
+    should_force_search,
+)
 from app.config import Settings
 from app.context.manager import ContextBundle, ContextManager, estimate_messages, estimate_tokens
 from app.context.state_card import StateCardManager
@@ -70,22 +76,67 @@ class TurnState:
     tool_events: list[dict[str, Any]] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
     recoverable_failures: int = 0
+    forced_search_used: bool = False
     message_chars: int = 0
     thought_chars: int = 0
     state_manager: StateCardManager | None = None
     repo: SessionRepository | None = None
 
 
-class StreamSplitter:
-    """Classifies streaming text into thought vs final-answer deltas for ReAct mode."""
+@dataclass
+class ForcedSearchOutcome:
+    executed: bool
+    status: str
+    reason: str | None = None
+    tool_call_id: str | None = None
+    result: ToolExecutionResult | None = None
 
-    def __init__(self, mode: str, emit: Emit) -> None:
+
+class StreamSplitter:
+    """Classifies streaming text into thought vs final-answer deltas for ReAct mode.
+
+    Final answers are buffered until the turn decides whether a forced web search
+    is required, so a refusal never reaches the user before the search runs.
+    """
+
+    def __init__(
+        self,
+        mode: str,
+        emit: Emit,
+        *,
+        buffer_final: bool = True,
+        buffer_limit: int = 20_000,
+    ) -> None:
         self.mode = mode
         self.emit = emit
+        self.buffer_final = buffer_final
+        self.buffer_limit = max(1, buffer_limit)
         self.pending = ""
         self.final_started = False
+        self.final_buffer = ""
+        self.buffered_chars = 0
+        self.buffer_limit_hit = False
         self.message_chars = 0
         self.thought_chars = 0
+
+    async def _final(self, text: str) -> None:
+        if not text:
+            return
+        if not self.buffer_final or self.buffer_limit_hit:
+            self.message_chars += len(text)
+            await self.emit("message_delta", {"delta": text})
+            return
+        if self.buffered_chars + len(text) > self.buffer_limit:
+            # 超限立即放行，后续正文不再缓冲，也不再做不确定判定。
+            self.buffer_limit_hit = True
+            released = self.final_buffer + text
+            self.final_buffer = ""
+            self.buffered_chars = 0
+            self.message_chars += len(released)
+            await self.emit("message_delta", {"delta": released})
+            return
+        self.final_buffer += text
+        self.buffered_chars += len(text)
 
     async def feed(self, chunk: ChatChunk) -> None:
         if chunk.reasoning:
@@ -93,13 +144,8 @@ class StreamSplitter:
             await self.emit("thought_delta", {"delta": chunk.reasoning})
         if not chunk.content:
             return
-        if self.mode == "native":
-            self.message_chars += len(chunk.content)
-            await self.emit("message_delta", {"delta": chunk.content})
-            return
-        if self.final_started:
-            self.message_chars += len(chunk.content)
-            await self.emit("message_delta", {"delta": chunk.content})
+        if self.mode == "native" or self.final_started:
+            await self._final(chunk.content)
             return
         self.pending += chunk.content
         match = FINAL_ANSWER_RE.search(self.pending)
@@ -112,8 +158,7 @@ class StreamSplitter:
             self.final_started = True
             self.pending = ""
             if after:
-                self.message_chars += len(after)
-                await self.emit("message_delta", {"delta": after})
+                await self._final(after)
             return
         keep = 24
         if len(self.pending) > keep:
@@ -123,13 +168,26 @@ class StreamSplitter:
                 self.thought_chars += len(safe)
                 await self.emit("thought_delta", {"delta": safe})
 
+    def take_final(self) -> str:
+        text, self.final_buffer = self.final_buffer, ""
+        self.buffered_chars = 0
+        return text
+
+    async def release_buffered(self) -> None:
+        """Flush buffered body when the model turns out not to answer yet."""
+        if not self.final_buffer:
+            return
+        text, self.final_buffer = self.final_buffer, ""
+        self.buffered_chars = 0
+        self.message_chars += len(text)
+        await self.emit("message_delta", {"delta": text})
+
     async def flush(self) -> None:
         if not self.pending:
             return
         text, self.pending = self.pending, ""
         if self.final_started:
-            self.message_chars += len(text)
-            await self.emit("message_delta", {"delta": text})
+            await self._final(text)
         else:
             self.thought_chars += len(text)
             await self.emit("thought_delta", {"delta": text})
@@ -137,6 +195,9 @@ class StreamSplitter:
     async def reset(self) -> None:
         self.pending = ""
         self.final_started = False
+        self.final_buffer = ""
+        self.buffered_chars = 0
+        self.buffer_limit_hit = False
         self.message_chars = 0
         self.thought_chars = 0
         await self.emit("context_update", {"reset": True})
@@ -167,6 +228,23 @@ class AgentLoop:
             self._registry = await self.executor.fetch_registry()
         return self._registry
 
+    @staticmethod
+    def _with_turn_ttft(emit: Emit, turn_span: Any, started_at: float) -> Emit:
+        """Record the delay from request entry to the first visible delta."""
+
+        seen = False
+
+        async def wrapped(kind: str, payload: dict[str, Any]) -> None:
+            nonlocal seen
+            if not seen and kind in {"thought_delta", "message_delta"}:
+                seen = True
+                turn_span.set(
+                    first_token_ms=int((time.monotonic() - started_at) * 1000)
+                )
+            await emit(kind, payload)
+
+        return wrapped
+
     async def run(
         self,
         session_id: UUID,
@@ -180,10 +258,15 @@ class AgentLoop:
         trace_id = trace_id or self.tracer.new_trace()
         bind_context(str(session_id))
         try:
-            async with self.tracer.span("request", session_id=str(session_id)):
-                async with self.tracer.span("turn", session_id=str(session_id)):
+            async with self.tracer.span("request", session_id=str(session_id)) as request_span:
+                async with self.tracer.span("turn", session_id=str(session_id)) as turn_span:
                     return await self._run(
-                        session_id, user_text, emit, client_message_id
+                        session_id,
+                        user_text,
+                        self._with_turn_ttft(
+                            emit, turn_span, request_span.started_at
+                        ),
+                        client_message_id,
                     )
         except AgentError as exc:
             await emit(
@@ -379,7 +462,11 @@ class AgentLoop:
                         db, state, repo, state_manager, emit, "budget_exceeded", registry
                     )
 
-            splitter = StreamSplitter(session.mode, emit)
+            splitter = StreamSplitter(
+                session.mode,
+                emit,
+                buffer_limit=self.settings.final_answer_buffer_max,
+            )
             try:
                 result = await self.gateway.complete(
                     state.conversation,
@@ -429,8 +516,21 @@ class AgentLoop:
                 )
             state.model_calls += 1
             await splitter.flush()
-            state.message_chars = splitter.message_chars
             parsed = self._parse(session.mode, result, registry)
+            if parsed.kind != "final":
+                # 非最终回答时缓冲正文只是模型的过程性输出，按原行为放行；
+                # 但 native 的正文若疑似拒绝收尾，则不提前展示给用户。
+                buffered_body = splitter.final_buffer.strip()
+                if not (
+                    session.mode == "native"
+                    and is_refusal_answer(
+                        buffered_body,
+                        match_window=self.settings.refusal_match_window,
+                        max_answer_len=self.settings.refusal_max_answer,
+                    )
+                ):
+                    await splitter.release_buffered()
+            state.message_chars = splitter.message_chars
 
             if parsed.kind == "invalid":
                 state.errors.append(parsed.reason)
@@ -443,7 +543,12 @@ class AgentLoop:
                     # MAX_SELF_CORRECT 用于限制 6.7 的可恢复工具错误。
                     state.self_corrects += 1
                     state.conversation.append(
-                        {"role": "assistant", "content": result.text or parsed.raw}
+                        {
+                            "role": "assistant",
+                            "content": self._model_text_for_context(
+                                result.text or parsed.raw
+                            ),
+                        }
                     )
                     state.conversation.append(
                         {
@@ -485,7 +590,9 @@ class AgentLoop:
                     content="",
                     meta={
                         "kind": "parse_error",
-                        "thought": (result.text or "")[:1000],
+                        "thought": self._model_text_for_context(result.text or "")[
+                            :1000
+                        ],
                         "reason": parsed.reason,
                         "provider": result.provider,
                         "usage": result.usage,
@@ -521,7 +628,90 @@ class AgentLoop:
             if parsed.kind == "final":
                 if session.mode == "react":
                     session.parse_failures = 0
-                answer = parsed.answer.strip()
+                buffered = splitter.take_final().strip()
+                answer = buffered or parsed.answer.strip()
+                replace_reason: str | None = None
+                has_ok_search = self._has_ok_search(state)
+                forced_available = (
+                    state.forced_search_used is False
+                    and self.settings.forced_search_max_per_turn >= 1
+                )
+                force = (
+                    not splitter.buffer_limit_hit
+                    and should_force_search(
+                        answer=answer,
+                        has_ok_search=has_ok_search,
+                        already_forced=not forced_available,
+                        enabled=self.settings.forced_search_enabled,
+                        finish_kind="final",
+                        match_window=self.settings.refusal_match_window,
+                        max_answer_len=self.settings.refusal_max_answer,
+                    )
+                )
+                # 6.1.4：总开关关闭或本轮强制次数上限为 0 时不发检索请求，
+                # 但仍拦截拒绝回答并回固定文案。
+                disabled_intercept = (
+                    not force
+                    and (
+                        not self.settings.forced_search_enabled
+                        or self.settings.forced_search_max_per_turn < 1
+                    )
+                    and not state.forced_search_used
+                    and not splitter.buffer_limit_hit
+                    and not has_ok_search
+                    and is_refusal_answer(
+                        answer,
+                        match_window=self.settings.refusal_match_window,
+                        max_answer_len=self.settings.refusal_max_answer,
+                    )
+                )
+                if force or disabled_intercept:
+                    state.forced_search_used = True
+                    outcome = await self._run_forced_search(
+                        db, repo, state, registry, emit
+                    )
+                    if outcome.status == "ok":
+                        if state.model_calls >= self.settings.max_model_calls_per_turn:
+                            return await self._wrap_up(
+                                db, state, repo, state_manager, emit,
+                                "max_model_calls", registry,
+                            )
+                        if self._over_budget(state):
+                            compacted = await self._compact_conversation(state, emit)
+                            if not compacted:
+                                return await self._wrap_up(
+                                    db, state, repo, state_manager, emit,
+                                    "budget_exceeded", registry,
+                                )
+                        self._append_forced_observation(state, outcome)
+                        continue
+                    # 检索不可用/为空等：固定文案作为 final 落库，不再二次强制。
+                    answer = FORCED_SEARCH_EMPTY_TEXT
+                    replace_reason = (
+                        f"search_{outcome.status}"
+                        if outcome.executed
+                        else f"search_skipped:{outcome.reason}"
+                    )
+                elif (
+                    state.forced_search_used
+                    and not splitter.buffer_limit_hit
+                    and is_refusal_answer(
+                        answer,
+                        match_window=self.settings.refusal_match_window,
+                        max_answer_len=self.settings.refusal_max_answer,
+                    )
+                ):
+                    await self.tracer.emit_event(
+                        "forced_answer_replaced",
+                        {
+                            "turn_no": state.turn_no,
+                            "reason": "refusal_after_search",
+                            "answer_chars": len(answer),
+                        },
+                    )
+                    answer = FORCED_SEARCH_EMPTY_TEXT
+                    replace_reason = "refusal_after_search"
+
                 if state.message_chars == 0 and answer:
                     await emit("message_delta", {"delta": answer})
                 await self._save_assistant(
@@ -534,6 +724,8 @@ class AgentLoop:
                         "provider": result.provider,
                         "layer": result.layer,
                         "usage": result.usage,
+                        "forced_search": state.forced_search_used,
+                        "replace_reason": replace_reason,
                     },
                 )
                 await state_manager.update_after_turn(
@@ -784,9 +976,10 @@ class AgentLoop:
         observation: str,
     ) -> None:
         if state.session.mode == "native":
+            content = self._model_text_for_context(result.text or "")
             assistant_message: dict[str, Any] = {
                 "role": "assistant",
-                "content": result.text or "",
+                "content": content,
                 "tool_calls": [
                     {
                         "id": tool_call_id,
@@ -817,6 +1010,280 @@ class AgentLoop:
             }
         )
         state.conversation.append({"role": "user", "content": f"Observation: {observation}"})
+
+    def _model_text_for_context(self, text: str) -> str:
+        """Drop refusal-like model text before it reaches context or storage."""
+        stripped = (text or "").strip()
+        if stripped and is_refusal_answer(
+            stripped,
+            match_window=self.settings.refusal_match_window,
+            max_answer_len=self.settings.refusal_max_answer,
+        ):
+            return ""
+        return text or ""
+
+    def _has_ok_search(self, state: TurnState) -> bool:
+        return any(
+            event.get("name") == "search" and event.get("status") == "ok"
+            for event in state.tool_events
+        )
+
+    def _forced_search_skip_reason(
+        self, state: TurnState, registry: dict[str, dict[str, Any]]
+    ) -> str | None:
+        if not self.settings.forced_search_enabled:
+            return "disabled"
+        if self.settings.forced_search_max_per_turn < 1:
+            return "max_per_turn_reached"
+        if "search" in (state.session.blocked_tools or []):
+            return "tool_disabled"
+        if "search" not in registry:
+            return "tool_missing"
+        if not getattr(self.mcp, "started", True):
+            return "mcp_offline"
+        if state.tool_iterations >= self.settings.max_tool_iterations:
+            return "max_tool_iterations"
+        if (
+            not state.task_counted
+            and state.session.task_turn_count >= self.settings.max_task_turns
+        ):
+            return "max_task_turns"
+        return None
+
+    async def _run_forced_search(
+        self,
+        db: Any,
+        repo: SessionRepository,
+        state: TurnState,
+        registry: dict[str, dict[str, Any]],
+        emit: Emit,
+    ) -> ForcedSearchOutcome:
+        query = forced_search_query(
+            state.user_input, self.settings.forced_search_query_max
+        )
+        skip_reason = self._forced_search_skip_reason(state, registry)
+        if skip_reason is not None:
+            await self.tracer.emit_event(
+                "search_forced_skipped",
+                {
+                    "trigger": "uncertainty",
+                    "reason": skip_reason,
+                    "query_chars": len(query),
+                },
+                session_id=str(state.session.id),
+                turn_no=state.turn_no,
+            )
+            return ForcedSearchOutcome(
+                executed=False, status="skipped", reason=skip_reason
+            )
+
+        arguments = {"query": query, "max_results": 5}
+        parsed = ParsedOutput(kind="action", name="search", arguments=arguments)
+        tool_call_id = uuid.uuid4().hex
+        await emit(
+            "tool_start",
+            {
+                "tool_call_id": tool_call_id,
+                "name": "search",
+                "arguments": arguments,
+                "turn_no": state.turn_no,
+            },
+        )
+        action_message = await self._save_assistant(
+            repo,
+            state,
+            content="",
+            meta={
+                "kind": "action",
+                "plan": "回答缺少可靠信息，后端强制联网检索",
+                "tool_name": "search",
+                "arguments": arguments,
+                "forced_search": True,
+            },
+        )
+        started = time.monotonic()
+        row = await repo.add_tool_call(
+            session_id=state.session.id,
+            turn_no=state.turn_no,
+            tool_name="search",
+            arguments=arguments,
+            status="running",
+            result_summary=None,
+            result_ref=None,
+            error=None,
+            latency_ms=0,
+            idempotency_key=None,
+            message_id=action_message.id,
+            call_id=uuid.UUID(hex=tool_call_id),
+        )
+        await db.commit()
+        tool_result = await self.executor.execute(
+            "search",
+            arguments,
+            session_id=state.session.id,
+            turn_no=state.turn_no,
+            tool_call_id=tool_call_id,
+        )
+        latency = int((time.monotonic() - started) * 1000)
+        await self._persist_tool_call(
+            repo,
+            state,
+            parsed,
+            tool_result,
+            tool_call_id,
+            latency,
+            row=row,
+        )
+        if tool_result.artifact_id:
+            await self._save_artifact_row(db, state, tool_result, tool_call_id)
+        await self._save_tool_message(repo, state, tool_result, tool_call_id)
+        await emit(
+            "tool_result",
+            {
+                "tool_call_id": tool_call_id,
+                "name": "search",
+                "status": "ok" if tool_result.ok else "error",
+                "summary": tool_result.summary if tool_result.ok else None,
+                "error": tool_result.error,
+                "latency_ms": tool_result.latency_ms,
+                "result_ref": tool_result.result_ref,
+                "attempts": tool_result.attempts,
+                "citations": tool_result.citations,
+            },
+        )
+        state.tool_events.append(
+            {
+                "tool_call_id": tool_call_id,
+                "name": "search",
+                "status": "ok" if tool_result.ok else "error",
+                "summary": tool_result.summary,
+                "error": tool_result.error,
+                "latency_ms": tool_result.latency_ms,
+                "result_ref": tool_result.result_ref,
+                "attempts": tool_result.attempts,
+                "citations": tool_result.citations,
+                "turn_no": state.turn_no,
+            }
+        )
+        state.tool_iterations += 1
+        if not state.task_counted:
+            state.session.task_turn_count = int(state.session.task_turn_count) + 1
+            state.task_counted = True
+        await self._record_tool_streak(state, "search", tool_result.ok)
+        await db.commit()
+
+        result_count = self._search_result_count(tool_result)
+        reachable_count = self._search_reachable_count(tool_result)
+        if not tool_result.ok:
+            state.errors.append(tool_result.error or "强制检索失败")
+            status = "error"
+        elif result_count == 0:
+            status = "empty"
+        else:
+            status = "ok"
+        await self.tracer.emit_event(
+            "search_forced",
+            {
+                "trigger": "uncertainty",
+                "query_chars": len(query),
+                "status": status,
+                "result_count": result_count,
+                "reachable_count": reachable_count,
+                "latency_ms": tool_result.latency_ms,
+                "error": tool_result.error if not tool_result.ok else None,
+            },
+            session_id=str(state.session.id),
+            turn_no=state.turn_no,
+        )
+        return ForcedSearchOutcome(
+            executed=True,
+            status=status,
+            tool_call_id=tool_call_id,
+            result=tool_result,
+        )
+
+    async def _record_tool_streak(self, state: TurnState, name: str, ok: bool) -> None:
+        session = state.session
+        streaks = dict(session.tool_failure_streaks or {})
+        if ok:
+            streaks[name] = 0
+            session.tool_failure_streaks = streaks
+            return
+        streak = int(streaks.get(name, 0)) + 1
+        streaks[name] = streak
+        session.tool_failure_streaks = streaks
+        if streak >= 3 and name not in (session.blocked_tools or []):
+            session.blocked_tools = [*(session.blocked_tools or []), name]
+            await self.tracer.emit_event(
+                "tool_disabled",
+                {"tool_name": name, "reason": "consecutive_failures"},
+            )
+
+    @staticmethod
+    def _search_result_count(result: ToolExecutionResult) -> int:
+        if not result.ok:
+            return 0
+        if isinstance(result.data, dict):
+            items = result.data.get("results")
+            if isinstance(items, list):
+                return len(items)
+            count = result.data.get("count")
+            if isinstance(count, (int, float)):
+                return int(count)
+        return len(result.citations)
+
+    @staticmethod
+    def _search_reachable_count(result: ToolExecutionResult) -> int:
+        return sum(1 for item in result.citations if item.get("reachable"))
+
+    def _append_forced_observation(
+        self, state: TurnState, outcome: ForcedSearchOutcome
+    ) -> None:
+        if outcome.result is None or outcome.tool_call_id is None:
+            return
+        result = outcome.result
+        arguments = result.arguments or {
+            "query": forced_search_query(
+                state.user_input, self.settings.forced_search_query_max
+            ),
+            "max_results": 5,
+        }
+        observation = self._observation_text(result)
+        if state.session.mode == "native":
+            state.conversation.append(
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": outcome.tool_call_id,
+                            "type": "function",
+                            "function": {
+                                "name": "search",
+                                "arguments": json.dumps(arguments, ensure_ascii=False),
+                            },
+                        }
+                    ],
+                }
+            )
+            state.conversation.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": outcome.tool_call_id,
+                    "content": observation,
+                }
+            )
+            return
+        state.conversation.append(
+            {
+                "role": "assistant",
+                "content": "Action: search\nAction Input: "
+                + json.dumps(arguments, ensure_ascii=False),
+            }
+        )
+        state.conversation.append(
+            {"role": "user", "content": f"Observation: {observation}"}
+        )
 
     def _parse(
         self, mode: str, result: ModelResult, registry: dict[str, dict[str, Any]]
@@ -1037,9 +1504,16 @@ class AgentLoop:
         registry: dict[str, dict[str, Any]],
     ) -> AgentRunResult:
         session = state.session
+        forced_search = state.forced_search_used
         answer = ""
+        replace_reason: str | None = None
         last_result: ModelResult | None = None
-        splitter = StreamSplitter(session.mode, emit)
+        splitter = StreamSplitter(
+            session.mode,
+            emit,
+            buffer_final=forced_search,
+            buffer_limit=self.settings.final_answer_buffer_max,
+        )
         over_budget = bool(
             state.bundle
             and estimate_messages(state.conversation) > state.bundle.threshold
@@ -1068,12 +1542,33 @@ class AgentLoop:
             except AgentError:
                 answer = ""
         await splitter.flush()
+        buffered = splitter.take_final().strip()
+        if buffered:
+            answer = buffered
+        if forced_search and not splitter.buffer_limit_hit and is_refusal_answer(
+            answer,
+            match_window=self.settings.refusal_match_window,
+            max_answer_len=self.settings.refusal_max_answer,
+        ):
+            await self.tracer.emit_event(
+                "forced_answer_replaced",
+                {
+                    "turn_no": state.turn_no,
+                    "reason": "refusal_after_search",
+                    "answer_chars": len(answer),
+                },
+            )
+            answer = FORCED_SEARCH_EMPTY_TEXT
+            replace_reason = "refusal_after_search"
         if not answer:
             answer = self._local_summary(state)
             await emit("message_delta", {"delta": answer})
         elif splitter.message_chars == 0:
             await emit("message_delta", {"delta": answer})
         meta: dict[str, Any] = {"kind": "wrap_up", "reason": reason}
+        if forced_search:
+            meta["forced_search"] = True
+            meta["replace_reason"] = replace_reason
         if last_result is not None:
             meta.update(
                 {

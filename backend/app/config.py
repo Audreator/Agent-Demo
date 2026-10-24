@@ -49,6 +49,14 @@ class Settings(BaseSettings):
     search_result_limit: int = 8000
     max_output_tokens: int = 4096
 
+    # T26102401: uncertainty interception and first-token latency
+    forced_search_enabled: bool = True
+    forced_search_max_per_turn: int = 1
+    forced_search_query_max: int = 500
+    final_answer_buffer_max: int = 20_000
+    refusal_match_window: int = 200
+    refusal_max_answer: int = 800
+
     model_layers: str = "deepseek,qwen,local"
     model_l1_base_url: str = ""
     model_l1_api_key: str = ""
@@ -88,6 +96,12 @@ class Settings(BaseSettings):
     admin_alert_min_turns: int = 10
     admin_alert_breaker_count: int = 1
     admin_alert_wrap_count: int = 3
+
+    @field_validator("forced_search_max_per_turn", mode="after")
+    @classmethod
+    def _clamp_forced_search(cls, value: int) -> int:
+        # 每轮最多强制检索一次；0 表示本轮不强制检索。
+        return max(0, min(1, value))
 
     @field_validator("agent_md_path", mode="before")
     @classmethod

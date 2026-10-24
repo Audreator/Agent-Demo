@@ -24,6 +24,8 @@
 - 全链路 trace：`trace_id / span_id / parent_span_id`，同时写 JSON 日志与 `events` 表
 - SSE 流式输出：`fetch + ReadableStream`，支持 `last_event_id` 断线续传
 - 30 个任务型轮次上限；纯聊天不计入，也不受上限限制
+- 最终回答命中“不知道 / 没有相关信息”时先隐藏，后端强制联网检索一次，仍无结果则统一回复固定文案
+- 管理后台提供首 Token P95：总览、趋势与模型分层
 
 ---
 
@@ -288,6 +290,12 @@ npm run dev
 | `DEEPSEEK_SEARCH_MODEL` | `deepseek-v4-pro` | 支持 `web_search` 的模型 |
 | `DOCS_ROOT` | `backend/docs` | `read_docs` 根目录 |
 | `ARTIFACTS_DIR` | `backend/artifacts` | 大结果 artifact 目录 |
+| `FORCED_SEARCH_ENABLED` | `true` | 关闭时不发检索请求，但仍拦截拒绝回答并回固定文案 |
+| `FORCED_SEARCH_MAX_PER_TURN` | `1` | 每轮强制检索上限，仅支持 0/1；0 不检索但仍回固定文案 |
+| `FORCED_SEARCH_QUERY_MAX` | `500` | 强制检索词最大字符 |
+| `FINAL_ANSWER_BUFFER_MAX` | `20000` | 最终回答缓冲上限，超限立即放行 |
+| `REFUSAL_MATCH_WINDOW` | `200` | 拒绝表述匹配窗口 |
+| `REFUSAL_MAX_ANSWER` | `800` | 超过该长度不判定为拒绝 |
 
 > `search` 固定使用 DeepSeek 原生联网搜索：请求 `POST /responses`，工具为 `{"type":"web_search"}`，只接受服务端返回的 `url_citation`，不解析模型自造链接。无 Key 或未返回 citations 时会明确失败。
 
@@ -351,6 +359,7 @@ python scripts/probe_search.py "杭州今天天气"
 - 断线重连：`POST` 时携带 `last_event_id`，从缺失位置回放并继续跟随活动流。
 - 请求幂等：`client_message_id` 同时存于内存缓冲与数据库，避免首包丢失重试或进程重启后重复执行。
 - 模型流中途失败：服务端发送 `context_update {reset: true}`，前端清除本次模型调用的半截内容与思考，再接收重试层的输出；已完成的工具卡片保留。
+- 最终回答改为整段到达；强制检索以现有工具卡片与引用列表呈现，不新增 SSE 事件名。
 
 ---
 
@@ -375,6 +384,8 @@ python scripts/probe_search.py "杭州今天天气"
 - 每个请求：`request → turn → context_build / model_call / tool_call`
 - 自动注入 `trace_id`、`span_id`、`parent_span_id`
 - 记录：`session_id`、`turn_no`、耗时、token 用量、错误码、工具名、参数摘要、结果大小
+- 首 Token：`model_call` / `model_success` / `turn` 事件携带 `first_token_ms`，后台按 P95 聚合
+- 强制检索：`search_forced`、`search_forced_skipped`、`forced_answer_replaced` 事件
 - 双写：按天 JSON 日志文件 + `events` 表
 - 按 trace 检索：`GET /api/traces/{trace_id}`
 
